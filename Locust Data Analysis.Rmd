@@ -1,0 +1,163 @@
+---
+title: "Locusts Code"
+output: html_document
+date: "2024-03-18"
+---
+Methods: KNN, LDA, QDA,
+
+```{r message=FALSE, warning=FALSE}
+#Import Libraries and Refresh Code
+library(zoo)
+library(MASS)
+library(caret)
+library(dplyr)
+library(tidyr)
+library(proxy) 
+library(MASS)
+
+rm(list=ls())
+```
+
+Apply featurization to data, using the sliding window technique on state.
+```{r}
+#replace csv's with whatever your file path is
+locusts_clip1<-read.csv('C:/Users/noaha/OneDrive/Desktop/Locust Data/locusts_clip1.csv')
+locusts_clip2<-read.csv('C:/Users/noaha/OneDrive/Desktop/Locust Data/locusts_clip2.csv')
+
+#order the sets by id and then frame
+locusts1_sort<-locusts_clip1[order(locusts_clip1$id, locusts_clip1$frame),]
+locusts2_sort<-locusts_clip2[order(locusts_clip2$id, locusts_clip2$frame),]
+
+rolling_mean <- function(x) {
+  rollapply(x, width = 5, FUN = mean, align = "right", partial = TRUE)
+} #includes current state and past four
+
+#apply the rolling function to each set
+locusts1_sort$rolling_mean_state<-ave(locusts1_sort$state,locusts1_sort$id,FUN =rolling_mean)
+locusts2_sort$rolling_mean_state<-ave(locusts2_sort$state,locusts2_sort$id,FUN =rolling_mean)
+```
+
+Remove all rows where the locust is not on screen.
+```{r}
+locusts1_sort <- locusts1_sort[complete.cases(locusts1_sort$x, locusts1_sort$y), ]
+locusts2_sort <- locusts2_sort[complete.cases(locusts2_sort$x, locusts2_sort$y), ]
+```
+
+More featurization, adding nearest distance for each locust per frame, and density of locusts.
+```{r}
+#all of this code is just one very long function, which takes measurements of all locusts in a certain frame and computes the distance between all of them to measure closeness and density, it is also coded to take any dataset so long as it has all needed variables, and can be used for either clip.
+calculate_distance_and_density <- function(data) {
+    data$distance <- sapply(seq_len(nrow(data)), function(i) { #distance calculations
+        current_x <- data$x[i]
+        current_y <- data$y[i]
+        current_frame <- data$frame[i]
+        same_frame_locusts <- data[data$frame == current_frame, ]
+        distances <- sqrt((current_x - same_frame_locusts$x)^2 + (current_y - same_frame_locusts$y)^2)
+        distances <- distances[-i]
+        distances <- distances[distances > 0]
+        finite_distances <- distances[is.finite(distances) & distances > 0]
+        if (length(finite_distances) > 0) {
+            min_distance <- min(finite_distances)
+        } else {
+            min_distance <- NA
+        }
+        return(min_distance)
+    })
+    data$density <- sapply(seq_len(nrow(data)), function(i) { #density calculations
+        current_x <- data$x[i]
+        current_y <- data$y[i]
+        current_frame <- data$frame[i]
+        same_frame_locusts <- data[data$frame == current_frame, ]
+        distances <- sqrt((current_x - same_frame_locusts$x)^2 + (current_y - same_frame_locusts$y)^2)
+        density <- sum(distances <= 3 & distances > 0)
+        return(density)
+    })
+    return(data)
+}
+
+#actually using the function on the datasets
+locusts1_sort <- calculate_distance_and_density(locusts1_sort)
+locusts2_sort <- calculate_distance_and_density(locusts2_sort)
+```
+
+Speed & Average Speed Featurization
+```{r}
+#this was written at a different time than the distance/density function, so the approach is a bit different. not using functions, but rather mutating data individually to append variables. (note: speed is a measure of the difference in position between two consecutive frames)
+locusts1_sort <- locusts1_sort %>%
+  arrange(id, frame)
+locusts1_sort <- locusts1_sort %>%
+  mutate(speed = sqrt((x - lag(x))^2 + (y - lag(y))^2))
+locusts1_sort <- locusts1_sort %>%
+  group_by(id) %>%
+  mutate(average_speed = rollmean(speed, k = 6, fill = NA, align = "right"))
+locusts1_sort[is.na(locusts1_sort)] <- 0
+
+locusts2_sort <- locusts2_sort %>% #same but for locusts2
+  arrange(id, frame)
+locusts2_sort <- locusts2_sort %>%
+  mutate(speed = sqrt((x - lag(x))^2 + (y - lag(y))^2))
+locusts2_sort <- locusts2_sort %>%
+  group_by(id) %>%
+  mutate(average_speed = rollmean(speed, k = 6, fill = NA, align = "right"))
+locusts2_sort[is.na(locusts2_sort)] <- 0
+```
+
+Acceleration Featurization
+```{r}
+#probably unnecesary featurization: takes the difference in speed between consecutive frames.
+locusts1_sort$acceleration <- c(NA, diff(locusts1_sort$speed))
+locusts2_sort$acceleration <- c(NA, diff(locusts2_sort$speed))
+```
+
+Create Train & Test Sets Using the Two Clips
+```{r}
+set.seed(123)
+
+#add 256 to each value of id in the second clip in order to distinguish locusts
+locusts2_sort$id<-locusts2_sort$id + 256
+
+#merge the two sets and index them into train and test sets at a 7/3 ratio.
+combined_locusts<-rbind(locusts1_sort,locusts2_sort)%>%filter(state>=0)
+index<-sample(nrow(combined_locusts), nrow(combined_locusts) * 0.7)
+train_data<-combined_locusts[index, ]
+test_data<-combined_locusts[-index, ]
+```
+
+LDA MODEL
+```{r}
+clean_traindata<- train_data[complete.cases(train_data), ] #remove incomplete observations
+clean_testdata<- test_data[complete.cases(test_data), ]
+
+lda_model<-lda(state ~ x + y + average_speed + density + acceleration + distance, data=clean_traindata)
+lda_predictions<-predict(lda_model, newdata=clean_testdata)
+
+correct_predictions<-sum(lda_predictions$class==clean_testdata$state)
+total_observations<-nrow(test_data)
+lda_accuracy<-correct_predictions/total_observations
+lda_accuracy
+```
+QDA MODEL
+```{r}
+qda_model<-qda(state ~ x + y + distance + density + average_speed, data=clean_traindata)
+qda_predictions<-predict(qda_model, newdata=clean_testdata)
+
+correct_predictions<-sum(qda_predictions$class==clean_testdata$state)
+total_observations<-nrow(test_data)
+qda_accuracy<-correct_predictions/total_observations
+qda_accuracy
+```
+
+KNN MODEL
+```{r}
+knn_model<-train(state~distance+average_speed+speed+density,data=clean_traindata, #create KNN model
+                   method="knn", 
+                   preProcess= c("center","scale"),
+                   trControl=trainControl(method="cv"))
+
+knn_predictions<-predict(knn_model,newdata=clean_testdata) #create preds
+
+clean_testdata$state<-as.factor(clean_testdata$state) #make preds into factors because r is mean
+knn_predictions<-factor(knn_predictions,levels=levels(clean_testdata$state))
+
+confusionMatrix(knn_predictions,clean_testdata$state) #display confusion matrix
+```
